@@ -238,6 +238,12 @@ show_progress() {
         echo "$agent_status"
     fi
 
+    # Show agent pool status
+    local pool_status=$(show_agent_pool_status 2>/dev/null)
+    if [ -n "$pool_status" ]; then
+        echo -e "${CYAN}$pool_status${NC}"
+    fi
+
     # Show pending messages
     local pending_msgs=$(show_pending_messages 2>/dev/null)
     if [ -n "$pending_msgs" ]; then
@@ -366,6 +372,9 @@ init_project() {
     # Initialize messaging system
     init_messaging
 
+    # Generate PM MCP config (now that STATUS_DIR exists)
+    generate_pm_mcp_config
+
     log_success "Project initialized"
 }
 
@@ -460,6 +469,74 @@ select_project() {
     fi
 }
 
+# Process task completions from pooled agents
+process_task_completions() {
+    local completions_json=$(check_task_completions 2>/dev/null)
+    [ -z "$completions_json" ] && return 0
+
+    # Parse JSON, create .completed files, and output for bash processing
+    while IFS='|' read -r action arg1 arg2 arg3 arg4; do
+        case "$action" in
+            COMPLETE)
+                log_success "Task completed by $arg1: $arg2"
+                ;;
+            HANDLE)
+                handle_task_completion "$arg1" "$arg2" "$arg3" "$arg4"
+                ;;
+            ERROR)
+                log_error "Task completion error: $arg1"
+                ;;
+        esac
+    done < <(python3 << PYEOF
+import json
+import os
+import sys
+from datetime import datetime
+
+completions_json = '''$completions_json'''
+status_dir = "$STATUS_DIR"
+
+try:
+    completions = json.loads(completions_json)
+
+    for c in completions:
+        msg_id = c.get('id', '')
+        agent = c.get('agent', '')
+        task = c.get('task', '')
+        summary = c.get('summary', '')
+        files = c.get('files', [])
+        files_str = ', '.join(files) if isinstance(files, list) else str(files)
+
+        if not msg_id or not task:
+            continue
+
+        # Create completed file
+        completed_file = os.path.join(status_dir, f"{task}.completed")
+        status_file = os.path.join(status_dir, f"{task}.status")
+
+        with open(completed_file, 'w') as f:
+            f.write(f"task: {task}\n")
+            f.write(f"agent: {agent}\n")
+            f.write(f"completed: {datetime.now().isoformat()}\n")
+            f.write(f"status: completed\n")
+            f.write(f"summary: {summary}\n")
+            f.write(f"files: {files_str}\n")
+
+        # Remove status file
+        if os.path.exists(status_file):
+            os.remove(status_file)
+
+        # Output for bash - use safe summary (no pipes/newlines)
+        safe_summary = summary.replace('|', '-').replace('\n', ' ')[:80]
+        print(f"COMPLETE|{agent}|{task}|{safe_summary}")
+        print(f"HANDLE|{msg_id}|{agent}|{task}|{safe_summary[:50]}")
+
+except Exception as e:
+    print(f"ERROR|{e}", file=sys.stderr)
+PYEOF
+)
+}
+
 # Main orchestration loop
 main_loop() {
     log "Starting main orchestration loop..."
@@ -512,6 +589,9 @@ main_loop() {
 
         # Step 6: Process any pending messages from agents
         process_pending_messages
+
+        # Step 7: Process task completions from pooled agents
+        process_task_completions
 
         # Check for shutdown between operations
         if [ "$SHUTDOWN_REQUESTED" = "true" ]; then

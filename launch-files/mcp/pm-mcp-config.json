@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp@latest"],
+      "env": {
+        "CHROME_HEADLESS": "true",
+        "CHROME_PATH": ""
+      }
+    },
+    "pm-control": {
+      "command": "node",
+      "args": ["${LAUNCH_DIR}/mcp/pm-control-server/server.js"],
+      "env": {
+        "STATUS_DIR": "${STATUS_DIR}",
+        "AGENTS_DIR": "${AGENTS_DIR}",
+        "WORKSPACE": "${WORKSPACE}"
+      }
+    }
+  }
+}

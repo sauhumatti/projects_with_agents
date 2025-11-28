@@ -15,6 +15,10 @@ init_messaging() {
     [ -f "$messages_dir/inbox.json" ] || echo '{"messages":[]}' > "$messages_dir/inbox.json"
     [ -f "$messages_dir/status.json" ] || echo '{"agents":{}}' > "$messages_dir/status.json"
 
+    # Initialize agent pool files
+    [ -f "$messages_dir/agent_pool.json" ] || echo '{"agents":{}}' > "$messages_dir/agent_pool.json"
+    [ -f "$messages_dir/assignments.json" ] || echo '{"pending":[],"accepted":[],"completed":[]}' > "$messages_dir/assignments.json"
+
     log "Messaging system initialized"
 }
 
@@ -36,7 +40,9 @@ try:
     with open(outbox_file, 'r') as f:
         data = json.load(f)
 
-    pending = [m for m in data.get('messages', []) if m.get('status') == 'pending']
+    # Get pending messages, excluding task_complete (handled by process_task_completions)
+    pending = [m for m in data.get('messages', [])
+               if m.get('status') == 'pending' and m.get('type') != 'task_complete']
 
     for msg in pending:
         msg_id = msg.get('id', '')
@@ -182,43 +188,64 @@ escalate_to_user() {
     local task="$2"
     local original_question="$3"
     local pm_question="$4"
+    local timeout_seconds=120  # 2 minute timeout
 
+    # Clear some space and make it VERY visible
     echo ""
+    echo ""
+    echo ""
+    echo -e "${BOLD}${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
     echo -e "${BOLD}${YELLOW}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${YELLOW}║                    PM NEEDS YOUR INPUT                                ║${NC}"
     echo -e "${BOLD}${YELLOW}╠═══════════════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${YELLOW}║${NC}  Regarding: $from_agent / $task"
+    echo -e "${YELLOW}║${NC}  Regarding: ${BOLD}$from_agent${NC} / ${BOLD}$task${NC}"
     echo -e "${BOLD}${YELLOW}╠═══════════════════════════════════════════════════════════════════════╣${NC}"
     echo ""
     echo -e "${CYAN}Agent's original question:${NC}"
-    echo "$original_question"
+    echo "$original_question" | head -10
     echo ""
     echo -e "${CYAN}PM asks you:${NC}"
-    echo "$pm_question"
+    echo "$pm_question" | head -10
     echo ""
     echo -e "${BOLD}${YELLOW}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${BOLD}${RED}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!${NC}"
     echo ""
 
-    # Play notification sound (urgent - multiple bells + system sound)
+    # Play notification sound (urgent - multiple beeps)
     notify_user "PM needs your input" "urgent"
 
-    # Prompt for response
-    echo "Your response (press Enter twice when done):"
+    # Prompt for response with timeout
+    echo -e "${BOLD}Your response (Enter twice to submit, or wait ${timeout_seconds}s for auto-skip):${NC}"
     echo ""
 
     local response=""
     local empty_count=0
+    local start_time=$(date +%s)
+
     while true; do
-        read -r line </dev/tty
-        if [ -z "$line" ]; then
-            empty_count=$((empty_count + 1))
-            if [ $empty_count -ge 2 ]; then
-                break
-            fi
-        else
-            empty_count=0
-            response="$response$line"$'\n'
+        local now=$(date +%s)
+        local elapsed=$((now - start_time))
+
+        if [ $elapsed -ge $timeout_seconds ]; then
+            echo ""
+            echo -e "${YELLOW}[Timeout - PM will proceed with best judgment]${NC}"
+            response="[USER TIMEOUT - No response provided within ${timeout_seconds} seconds. Please proceed with your best judgment.]"
+            break
         fi
+
+        # Read with 5 second timeout per line
+        if read -t 5 -r line </dev/tty 2>/dev/null; then
+            if [ -z "$line" ]; then
+                empty_count=$((empty_count + 1))
+                if [ $empty_count -ge 2 ]; then
+                    break
+                fi
+            else
+                empty_count=0
+                response="$response$line"$'\n'
+            fi
+        fi
+        # If read times out, loop continues and checks overall timeout
     done
 
     echo "$response"
@@ -393,6 +420,313 @@ try:
             from_agent = msg.get('from', 'unknown')
             preview = msg.get('question', msg.get('message', ''))[:50]
             print(f"    - [{to}] from {from_agent}: {preview}...")
+
+except Exception as e:
+    pass
+PYEOF
+}
+
+# ============================================================================
+# AGENT POOL MANAGEMENT (PM Tools)
+# ============================================================================
+
+# List all agents in the pool with their status
+list_agent_pool() {
+    local messages_dir="$STATUS_DIR/messages"
+    local pool_file="$messages_dir/agent_pool.json"
+
+    [ -f "$pool_file" ] || { echo "No agents in pool"; return 0; }
+
+    python3 << PYEOF
+import json
+from datetime import datetime
+
+pool_file = "$pool_file"
+
+try:
+    with open(pool_file, 'r') as f:
+        data = json.load(f)
+
+    agents = data.get('agents', {})
+    if not agents:
+        print("No agents registered in pool")
+        exit(0)
+
+    # Group by status
+    active = []
+    standby = []
+    completed = []
+    terminated = []
+
+    for agent_id, info in agents.items():
+        status = info.get('status', 'unknown')
+        role = info.get('role', 'unknown')
+        capabilities = ', '.join(info.get('capabilities', []))
+        current_task = info.get('currentTask', 'none')
+        last_seen = info.get('lastSeen', '')
+
+        agent_info = {
+            'id': agent_id,
+            'role': role,
+            'capabilities': capabilities,
+            'task': current_task,
+            'lastSeen': last_seen
+        }
+
+        if status == 'active':
+            active.append(agent_info)
+        elif status == 'standby':
+            standby.append(agent_info)
+        elif status == 'completed':
+            completed.append(agent_info)
+        else:
+            terminated.append(agent_info)
+
+    # Print summary
+    print(f"Agent Pool Status:")
+    print(f"  Active: {len(active)}  |  Standby: {len(standby)}  |  Completed: {len(completed)}  |  Terminated: {len(terminated)}")
+    print("")
+
+    if standby:
+        print("AVAILABLE FOR WORK:")
+        for a in standby:
+            print(f"  [{a['id']}] role={a['role']} caps=[{a['capabilities']}]")
+        print("")
+
+    if active:
+        print("CURRENTLY WORKING:")
+        for a in active:
+            print(f"  [{a['id']}] working on: {a['task']}")
+        print("")
+
+except Exception as e:
+    print(f"Error reading pool: {e}")
+PYEOF
+}
+
+# Get list of standby agents (for PM decision making)
+get_standby_agents() {
+    local messages_dir="$STATUS_DIR/messages"
+    local pool_file="$messages_dir/agent_pool.json"
+
+    [ -f "$pool_file" ] || return 0
+
+    python3 << PYEOF
+import json
+
+pool_file = "$pool_file"
+
+try:
+    with open(pool_file, 'r') as f:
+        data = json.load(f)
+
+    for agent_id, info in data.get('agents', {}).items():
+        if info.get('status') == 'standby':
+            role = info.get('role', '')
+            capabilities = ','.join(info.get('capabilities', []))
+            print(f"{agent_id}|{role}|{capabilities}")
+
+except Exception as e:
+    pass
+PYEOF
+}
+
+# Assign a task to a waiting agent
+assign_task_to_agent() {
+    local agent_id="$1"
+    local task_id="$2"
+    local branch="$3"
+    local task_type="$4"
+    local description="$5"
+
+    local messages_dir="$STATUS_DIR/messages"
+    local assignments_file="$messages_dir/assignments.json"
+    local pool_file="$messages_dir/agent_pool.json"
+
+    python3 << PYEOF
+import json
+import uuid
+from datetime import datetime
+import os
+
+assignments_file = "$assignments_file"
+pool_file = "$pool_file"
+agent_id = "$agent_id"
+task_id = "$task_id"
+branch = "$branch"
+task_type = "$task_type"
+description = '''$description'''
+
+try:
+    # Read existing assignments
+    if os.path.exists(assignments_file):
+        with open(assignments_file, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {"pending": [], "accepted": [], "completed": []}
+
+    # Create new assignment
+    assignment = {
+        "id": str(uuid.uuid4()),
+        "agentId": agent_id,
+        "taskId": task_id,
+        "branch": branch,
+        "type": task_type,
+        "description": description.strip(),
+        "assignedAt": datetime.now().isoformat()
+    }
+
+    data['pending'] = data.get('pending', [])
+    data['pending'].append(assignment)
+
+    # Write atomically
+    tmp_file = assignments_file + ".tmp"
+    with open(tmp_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp_file, assignments_file)
+
+    # Also update agent pool status to 'assigned' so it's not picked again
+    if os.path.exists(pool_file):
+        with open(pool_file, 'r') as f:
+            pool = json.load(f)
+
+        if 'agents' in pool and agent_id in pool['agents']:
+            pool['agents'][agent_id]['status'] = 'assigned'
+            pool['agents'][agent_id]['currentTask'] = task_id
+            pool['agents'][agent_id]['lastSeen'] = datetime.now().isoformat()
+
+            tmp_file = pool_file + ".tmp"
+            with open(tmp_file, 'w') as f:
+                json.dump(pool, f, indent=2)
+            os.rename(tmp_file, pool_file)
+
+    print(f"Assignment created: {task_id} -> {agent_id}")
+
+except Exception as e:
+    print(f"Error: {e}", file=__import__('sys').stderr)
+PYEOF
+
+    log "Assigned task $task_id to waiting agent $agent_id"
+}
+
+# Check for completed tasks and process them
+# Returns JSON array for robust parsing
+check_task_completions() {
+    local messages_dir="$STATUS_DIR/messages"
+    local outbox="$messages_dir/outbox.json"
+
+    [ -f "$outbox" ] || return 0
+
+    # Look for task_complete messages - output as JSON for safe parsing
+    python3 << PYEOF
+import json
+
+outbox_file = "$outbox"
+
+try:
+    with open(outbox_file, 'r') as f:
+        data = json.load(f)
+
+    completions = [m for m in data.get('messages', [])
+                   if m.get('type') == 'task_complete' and m.get('status') == 'pending']
+
+    if completions:
+        # Output as JSON array for robust parsing
+        output = []
+        for msg in completions:
+            output.append({
+                'id': msg.get('id', ''),
+                'agent': msg.get('from', ''),
+                'task': msg.get('task', ''),
+                'summary': msg.get('summary', ''),
+                'files': msg.get('filesChanged', [])
+            })
+        print(json.dumps(output))
+
+except Exception as e:
+    pass
+PYEOF
+}
+
+# Process a task completion (mark message as handled, update status)
+handle_task_completion() {
+    local msg_id="$1"
+    local agent_id="$2"
+    local task_id="$3"
+    local summary="$4"
+
+    log_success "Agent $agent_id completed: $summary"
+
+    # Mark message as handled
+    update_message_status "$msg_id" "handled"
+
+    # Could trigger follow-up actions here (e.g., run tests, code review)
+}
+
+# Try to assign a pending task to an available agent
+try_assign_to_pool() {
+    local task_id="$1"
+    local branch="$2"
+    local task_type="$3"
+    local description="$4"
+    local preferred_capabilities="$5"
+
+    # Get standby agents
+    local standby_agents=$(get_standby_agents)
+
+    [ -z "$standby_agents" ] && return 1  # No available agents
+
+    # Find a matching agent (simple matching for now)
+    local best_agent=""
+    while IFS='|' read -r agent_id role capabilities; do
+        [ -z "$agent_id" ] && continue
+
+        # If we need specific capabilities, check for match
+        if [ -n "$preferred_capabilities" ]; then
+            if echo "$capabilities" | grep -qi "$preferred_capabilities"; then
+                best_agent="$agent_id"
+                break
+            fi
+        else
+            # Any available agent
+            best_agent="$agent_id"
+            break
+        fi
+    done <<< "$standby_agents"
+
+    if [ -n "$best_agent" ]; then
+        assign_task_to_agent "$best_agent" "$task_id" "$branch" "$task_type" "$description"
+        return 0
+    fi
+
+    return 1  # No matching agent found
+}
+
+# Display agent pool status (for progress display)
+show_agent_pool_status() {
+    local messages_dir="$STATUS_DIR/messages"
+    local pool_file="$messages_dir/agent_pool.json"
+
+    [ -f "$pool_file" ] || return 0
+
+    python3 << PYEOF
+import json
+
+pool_file = "$pool_file"
+
+try:
+    with open(pool_file, 'r') as f:
+        data = json.load(f)
+
+    agents = data.get('agents', {})
+    if not agents:
+        exit(0)
+
+    active = sum(1 for a in agents.values() if a.get('status') == 'active')
+    standby = sum(1 for a in agents.values() if a.get('status') == 'standby')
+
+    if active > 0 or standby > 0:
+        print(f"  Pool: {active} active, {standby} standby")
 
 except Exception as e:
     pass

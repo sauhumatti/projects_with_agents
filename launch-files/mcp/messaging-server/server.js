@@ -25,6 +25,8 @@ if (!fs.existsSync(MESSAGES_DIR)) {
 const OUTBOX_FILE = path.join(MESSAGES_DIR, "outbox.json");
 const INBOX_FILE = path.join(MESSAGES_DIR, "inbox.json");
 const STATUS_FILE = path.join(MESSAGES_DIR, "status.json");
+const AGENT_POOL_FILE = path.join(MESSAGES_DIR, "agent_pool.json");
+const ASSIGNMENTS_FILE = path.join(MESSAGES_DIR, "assignments.json");
 
 // Helper to read JSON file safely
 function readJsonFile(filePath) {
@@ -103,6 +105,85 @@ function updateStatus(status, details = {}) {
   };
 
   writeJsonFile(STATUS_FILE, statusData);
+}
+
+// Register agent in pool
+function registerAgent(role, capabilities = []) {
+  const pool = readJsonFile(AGENT_POOL_FILE);
+  pool.agents = pool.agents || {};
+
+  pool.agents[AGENT_ID] = {
+    role: role,
+    capabilities: capabilities,
+    status: "active",
+    currentTask: TASK_ID,
+    registeredAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString()
+  };
+
+  writeJsonFile(AGENT_POOL_FILE, pool);
+}
+
+// Update agent status in pool
+function updateAgentPool(status, currentTask = null) {
+  const pool = readJsonFile(AGENT_POOL_FILE);
+  pool.agents = pool.agents || {};
+
+  if (pool.agents[AGENT_ID]) {
+    pool.agents[AGENT_ID].status = status;
+    pool.agents[AGENT_ID].currentTask = currentTask;
+    pool.agents[AGENT_ID].lastSeen = new Date().toISOString();
+  }
+
+  writeJsonFile(AGENT_POOL_FILE, pool);
+}
+
+// Check for new assignment
+function checkAssignment() {
+  const assignments = readJsonFile(ASSIGNMENTS_FILE);
+  const myAssignment = assignments.pending?.find(a => a.agentId === AGENT_ID);
+  return myAssignment || null;
+}
+
+// Mark assignment as accepted
+function acceptAssignment(assignmentId) {
+  const assignments = readJsonFile(ASSIGNMENTS_FILE);
+  assignments.pending = assignments.pending || [];
+  assignments.accepted = assignments.accepted || [];
+
+  const idx = assignments.pending.findIndex(a => a.id === assignmentId);
+  if (idx >= 0) {
+    const assignment = assignments.pending.splice(idx, 1)[0];
+    assignment.acceptedAt = new Date().toISOString();
+    assignments.accepted.push(assignment);
+    writeJsonFile(ASSIGNMENTS_FILE, assignments);
+    return assignment;
+  }
+  return null;
+}
+
+// Wait for new assignment (blocking)
+async function waitForAssignment(timeoutMs = 600000) {
+  const startTime = Date.now();
+  const pollInterval = 2000; // 2 seconds
+
+  // Mark as standby in pool
+  updateAgentPool("standby", null);
+  updateStatus("standby", { waiting_for: "assignment" });
+
+  while (Date.now() - startTime < timeoutMs) {
+    const assignment = checkAssignment();
+    if (assignment) {
+      // Accept and return
+      acceptAssignment(assignment.id);
+      updateAgentPool("active", assignment.taskId);
+      updateStatus("in_progress", { task: assignment.taskId });
+      return assignment;
+    }
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+
+  return null; // Timeout - agent should terminate
 }
 
 // Create MCP server
@@ -201,6 +282,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["message"]
+        }
+      },
+      {
+        name: "task_complete",
+        description: "Report that your current task is complete. Call this when you've finished the assigned work. You'll then enter standby mode waiting for a new assignment from the PM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            summary: {
+              type: "string",
+              description: "Brief summary of what you accomplished"
+            },
+            files_changed: {
+              type: "array",
+              items: { type: "string" },
+              description: "List of files you created or modified"
+            }
+          },
+          required: ["summary"]
+        }
+      },
+      {
+        name: "await_assignment",
+        description: "Enter standby mode and wait for the PM to assign you a new task. This blocks until a new task is assigned or timeout (10 min). Use this after completing a task to stay available for more work.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            capabilities: {
+              type: "array",
+              items: { type: "string" },
+              description: "Your capabilities (e.g., 'research', 'coding', 'testing', 'visual-qa')"
+            }
+          }
         }
       }
     ]
@@ -318,6 +432,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         ]
       };
+    }
+
+    case "task_complete": {
+      const { summary, files_changed = [] } = args;
+
+      // Notify PM of completion
+      const outbox = readJsonFile(OUTBOX_FILE);
+      outbox.messages.push({
+        id: crypto.randomUUID(),
+        from: AGENT_ID,
+        task: TASK_ID,
+        to: "pm",
+        type: "task_complete",
+        summary: summary,
+        filesChanged: files_changed,
+        timestamp: new Date().toISOString(),
+        status: "pending"  // Required for orchestrator to process
+      });
+      writeJsonFile(OUTBOX_FILE, outbox);
+
+      // Update status
+      updateStatus("completed", { summary, files_changed });
+      updateAgentPool("completed", TASK_ID);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Task ${TASK_ID} marked complete. Summary: ${summary}\nYou can now call await_assignment() to get a new task.`
+          }
+        ]
+      };
+    }
+
+    case "await_assignment": {
+      const { capabilities = [] } = args;
+
+      // Register in pool with capabilities
+      registerAgent(AGENT_ID.split('-')[0], capabilities);
+
+      // Wait for assignment
+      const assignment = await waitForAssignment(600000); // 10 min timeout
+
+      if (assignment) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `NEW ASSIGNMENT RECEIVED!\n\nTask ID: ${assignment.taskId}\nBranch: ${assignment.branch}\nType: ${assignment.type}\n\nDescription:\n${assignment.description}\n\nStart working on this task now.`
+            }
+          ]
+        };
+      } else {
+        // Timeout - agent should exit
+        updateAgentPool("terminated", null);
+        return {
+          content: [
+            {
+              type: "text",
+              text: "No new assignment received within timeout. You may now exit gracefully."
+            }
+          ]
+        };
+      }
     }
 
     default:

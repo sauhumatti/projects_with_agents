@@ -104,24 +104,42 @@ PYEOF
     fi
 
     local task_count=0
+    local assigned_to_pool=0
 
     # Process each ready task
     while IFS='|' read -r task_id branch agent task_type description; do
         if [ -n "$task_id" ] && [ -n "$agent" ]; then
-            log "Dispatching $agent for $task_type task: $task_id"
-            dispatch_single_agent "$task_id" "$branch" "$agent" "$description" &
-            task_count=$((task_count + 1))
+            # First, try to assign to a waiting agent in the pool
+            if try_assign_to_pool "$task_id" "$branch" "$task_type" "$description" "$task_type"; then
+                log "Assigned $task_id to pooled agent"
+                assigned_to_pool=$((assigned_to_pool + 1))
 
-            # Respect parallel limit
-            if [ $task_count -ge $MAX_PARALLEL_AGENTS ]; then
+                # Create status file to mark task as in-progress
+                local status_file="$STATUS_DIR/${task_id}.status"
+                cat > "$status_file" <<EOF
+task: $task_id
+agent: pooled
+branch: $branch
+started: $(date -Iseconds)
+status: assigned_to_pool
+EOF
+            else
+                # No pooled agent available, spawn a new one
+                log "Dispatching new $agent for $task_type task: $task_id"
+                dispatch_single_agent "$task_id" "$branch" "$agent" "$description" &
+                task_count=$((task_count + 1))
+            fi
+
+            # Respect parallel limit (count both pooled and new)
+            if [ $((task_count + assigned_to_pool)) -ge $MAX_PARALLEL_AGENTS ]; then
                 log_warn "Reached max parallel agents ($MAX_PARALLEL_AGENTS)"
                 break
             fi
         fi
     done <<< "$tasks_to_dispatch"
 
-    if [ $task_count -gt 0 ]; then
-        log_success "Dispatched $task_count agents"
+    if [ $task_count -gt 0 ] || [ $assigned_to_pool -gt 0 ]; then
+        log_success "Dispatched: $task_count new agents, $assigned_to_pool to pool"
         # Wait a bit for agents to start before next cycle
         sleep 5
     fi
@@ -224,11 +242,26 @@ USE ask_pm WHEN:
 
 The PM will escalate to the user if needed - that's not your concern.
 
+PERSISTENT AGENT LIFECYCLE:
+You are a persistent agent. After completing your task, you stay alive to receive more work.
+
+Lifecycle tools:
+- task_complete(summary, files_changed?) - Call when you finish your current task
+- await_assignment(capabilities?) - Enter standby and wait for PM to assign new work
+
+YOUR WORKFLOW:
+1. Complete the task described above
+2. Call task_complete() with a summary of what you did
+3. Call await_assignment() with your capabilities (e.g., ['coding', 'testing', 'research'])
+4. When you receive a new assignment, work on it
+5. Repeat steps 2-4 until await_assignment() times out (10 min with no work)
+
 IMPORTANT:
 - Create the necessary files to complete this task
 - Make sure your code is complete and working
 - Use environment variables for any API keys or secrets - they are already set
-- If testing with a dev server, make sure to kill it when done (or it will be cleaned up automatically)"
+- If testing with a dev server, make sure to kill it when done (or it will be cleaned up automatically)
+- After each task, call task_complete() then await_assignment() to stay available for more work"
 
     # Dispatch based on agent type (with environment variables loaded)
     local result=""
