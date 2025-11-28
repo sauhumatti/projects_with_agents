@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp@latest"]
+    },
+    "messaging": {
+      "command": "node",
+      "args": ["/home/sauhumatti/gemini/launch-files/mcp/messaging-server/server.js"],
+      "env": {
+        "ORCHESTRATOR_MESSAGES_DIR": "${ORCHESTRATOR_MESSAGES_DIR}",
+        "ORCHESTRATOR_AGENT_ID": "${ORCHESTRATOR_AGENT_ID}",
+        "ORCHESTRATOR_TASK_ID": "${ORCHESTRATOR_TASK_ID}"
+      }
+    }
+  }
+}

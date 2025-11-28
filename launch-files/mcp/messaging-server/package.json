@@ -1,0 +1,13 @@
+{
+  "name": "orchestrator-messaging-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for agent-PM-user messaging in the orchestrator",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

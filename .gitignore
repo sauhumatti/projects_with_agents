@@ -1,0 +1,13 @@
+# Previous project runs (don't commit)
+runtime/
+screenshots/
+
+# Node modules
+node_modules/
+
+# Logs
+*.log
+
+# Environment files with secrets
+*.env
+resources.env
