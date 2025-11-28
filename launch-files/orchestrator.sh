@@ -823,6 +823,42 @@ case "${1:-}" in
             echo "Usage: $0 logs <project-name>"
         fi
         ;;
+    web)
+        # Start the web UI
+        echo ""
+        echo -e "${BOLD}${CYAN}Starting Web UI...${NC}"
+        echo ""
+
+        WEB_UI_DIR="$SCRIPT_DIR/web-ui"
+
+        if [ ! -d "$WEB_UI_DIR" ]; then
+            log_error "Web UI not found at $WEB_UI_DIR"
+            exit 1
+        fi
+
+        # Check if dependencies are installed
+        if [ ! -d "$WEB_UI_DIR/node_modules" ]; then
+            log "Installing dependencies..."
+            cd "$WEB_UI_DIR" && npm install
+        fi
+
+        if [ ! -d "$WEB_UI_DIR/client/node_modules" ]; then
+            log "Installing client dependencies..."
+            cd "$WEB_UI_DIR/client" && npm install
+        fi
+
+        # Export runtime directory for the server
+        export RUNTIME_DIR="$RUNTIME_DIR"
+
+        echo ""
+        echo -e "${GREEN}Starting Web UI at http://localhost:3000${NC}"
+        echo -e "${YELLOW}Backend API at http://localhost:3001${NC}"
+        echo ""
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        cd "$WEB_UI_DIR" && npm run dev
+        ;;
     *)
         echo ""
         echo -e "${BOLD}Multi-Agent Orchestrator${NC}"
@@ -835,6 +871,7 @@ case "${1:-}" in
         echo "  list                    List all projects"
         echo "  status [project]        Show project status (list all if no name)"
         echo "  logs <project>          View latest session log"
+        echo "  web                     Start web UI dashboard"
         echo ""
         echo -e "${BOLD}Examples:${NC}"
         echo "  $0 start \"Build a weather CLI app\""

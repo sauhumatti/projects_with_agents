@@ -182,13 +182,142 @@ Be specific and direct. Just give the answer, no preamble."
     esac
 }
 
+# Check if web UI is available (responds to health check)
+is_web_ui_available() {
+    curl -s -o /dev/null -w "%{http_code}" "http://localhost:3001/health" 2>/dev/null | grep -q "200"
+}
+
+# Escalate a question to the user via web UI
+escalate_to_web() {
+    local from_agent="$1"
+    local task="$2"
+    local original_question="$3"
+    local pm_question="$4"
+    local timeout_seconds=300  # 5 minute timeout for web
+
+    local messages_dir="$STATUS_DIR/messages"
+    local outbox="$messages_dir/outbox.json"
+    local inbox="$messages_dir/inbox.json"
+
+    # Create escalation message in outbox
+    local msg_id=$(python3 << PYEOF
+import json
+import uuid
+import os
+from datetime import datetime
+
+outbox_file = "$outbox"
+from_agent = "$from_agent"
+task = "$task"
+original_question = '''$original_question'''
+pm_question = '''$pm_question'''
+
+msg_id = str(uuid.uuid4())
+
+try:
+    if os.path.exists(outbox_file):
+        with open(outbox_file, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {"messages": []}
+
+    data['messages'].append({
+        "id": msg_id,
+        "from": from_agent,
+        "task": task,
+        "to": "user",
+        "type": "escalation",
+        "question": pm_question,
+        "originalQuestion": original_question,
+        "priority": "blocking",
+        "timestamp": datetime.now().isoformat(),
+        "status": "pending",
+        "escalatedToUser": True
+    })
+
+    tmp_file = outbox_file + ".tmp"
+    with open(tmp_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.rename(tmp_file, outbox_file)
+
+    print(msg_id)
+except Exception as e:
+    print(f"ERROR:{e}", file=__import__('sys').stderr)
+PYEOF
+)
+
+    if [ -z "$msg_id" ] || [[ "$msg_id" == ERROR* ]]; then
+        log_error "Failed to create web escalation message"
+        return 1
+    fi
+
+    log "Waiting for user response via web UI (message: $msg_id)..."
+
+    # Poll for response
+    local start_time=$(date +%s)
+    local poll_interval=2
+
+    while true; do
+        local now=$(date +%s)
+        local elapsed=$((now - start_time))
+
+        if [ $elapsed -ge $timeout_seconds ]; then
+            log_warn "Web UI response timeout"
+            echo "[USER TIMEOUT - No response provided via web UI. Please proceed with your best judgment.]"
+            return 0
+        fi
+
+        # Check for response in inbox
+        local response=$(python3 << PYEOF2
+import json
+import os
+
+inbox_file = "$inbox"
+msg_id = "$msg_id"
+
+try:
+    if os.path.exists(inbox_file):
+        with open(inbox_file, 'r') as f:
+            data = json.load(f)
+
+        for msg in data.get('messages', []):
+            if msg.get('replyTo') == msg_id:
+                print(msg.get('answer', ''))
+                exit(0)
+
+except Exception as e:
+    pass
+PYEOF2
+)
+
+        if [ -n "$response" ]; then
+            log_success "Received response from web UI"
+            echo "$response"
+            return 0
+        fi
+
+        sleep $poll_interval
+    done
+}
+
 # Escalate a question to the user (called by PM only)
+# Automatically uses web UI if available, falls back to terminal
 escalate_to_user() {
     local from_agent="$1"
     local task="$2"
     local original_question="$3"
     local pm_question="$4"
     local timeout_seconds=120  # 2 minute timeout
+
+    # Check if web UI is available
+    if is_web_ui_available; then
+        log "Using web UI for user escalation"
+        escalate_to_web "$from_agent" "$task" "$original_question" "$pm_question"
+        return $?
+    fi
+
+    # Fall back to terminal-based escalation
+    log "Using terminal for user escalation (web UI not available)"
 
     # Clear some space and make it VERY visible
     echo ""
